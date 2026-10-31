@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">كابتن أيتوس</string>
+    <string name="accessibility_service_label">قارئ طلبات كابتن أيتوس</string>
+    <string name="accessibility_service_description">بيقرا كروت طلبات إن درايف وديدي وأوبر فقط (من نص الشاشة ومن لقطة شاشة بتتقرا بالـ OCR جوه الموبايل وبتتمسح فوراً) عشان يحسب السعر والمسافة وصافي الربح ويعرض حكم فوري. مبيضغطش على أي زرار ولا بيقبل أو بيرفض بدالك.</string>
+</resources>
