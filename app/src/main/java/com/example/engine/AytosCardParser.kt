@@ -4,6 +4,8 @@ import com.example.model.OrderDetails
 import com.example.model.PaymentMethod
 import com.example.model.SupportedApp
 import java.util.regex.Pattern
+import kotlin.math.abs
+import kotlin.math.roundToInt
 
 /**
  * Robust multilingual (Arabic & English) parser for extracting ride offer card metrics.
@@ -68,7 +70,11 @@ class AytosCardParser {
      * مش على الكلام العربي. الأولوية دايماً لللي اتقرا من نص الشاشة نفسه.
      * ده تخمين منظم: السعر هو أكبر رقم على الشاشة، والمسافات هي الأرقام العشرية بالترتيب من فوق لتحت.
      */
-    fun fillFromOcrNumbers(order: OrderDetails, numbers: List<OcrNumber>): OrderDetails {
+    fun fillFromOcrNumbers(
+        order: OrderDetails,
+        numbers: List<OcrNumber>,
+        guessDistances: Boolean = true
+    ): OrderDetails {
         var fare = order.fare
         var pickup = order.pickupDistanceKm
         var trip = order.tripDistanceKm
@@ -80,7 +86,7 @@ class AytosCardParser {
                 ?.value
         }
 
-        if (pickup == null && trip == null) {
+        if (guessDistances && pickup == null && trip == null) {
             val distances = numbers
                 .filter { n ->
                     n.text.contains('.') &&
@@ -104,6 +110,66 @@ class AytosCardParser {
         }
 
         return order.copy(fare = fare, pickupDistanceKm = pickup, tripDistanceKm = trip)
+    }
+
+    private fun tenth(v: Double): Int = (v * 10).roundToInt()
+
+    /** كل المسافات (كم أو متر) في سطر واحد، بالكيلومتر. */
+    private fun extractLineDistances(line: String): List<Double> {
+        val out = mutableListOf<Double>()
+        val km = distanceKmRegex.matcher(line)
+        while (km.find()) {
+            km.group(1)?.replace(",", ".")?.toDoubleOrNull()?.let { out.add(it) }
+        }
+        val m = distanceMeterRegex.matcher(line)
+        while (m.find()) {
+            m.group(1)?.toDoubleOrNull()?.let { out.add(it / 1000.0) }
+        }
+        return out
+    }
+
+    /**
+     * إن درايف: بيرجع (استلام، رحلة) من النص بس لو واضح.
+     * - لو في رقم بعلامة ~ يبقى هو الاستلام، وأي رقم تاني مختلف (واحد بس) هو الرحلة.
+     * - من غير علامة ~: لو رقم واحد بس يبقى استلام، ولو اتنين والأكتر تكراراً هو الاستلام.
+     * - غير كده بنسيب الاتنين فاضيين والـ OCR الملوّن هو اللي يحدد، ومبنخمنش.
+     */
+    private fun resolveInDriveDistances(tilde: List<Double>, all: List<Double>): Pair<Double?, Double?> {
+        if (all.isEmpty()) return Pair(null, null)
+        if (tilde.isNotEmpty()) {
+            val p = tilde[0]
+            val others = all.filter { abs(it - p) > 0.15 }.distinctBy { tenth(it) }
+            val trip = if (others.size == 1) others[0] else null
+            return Pair(p, trip)
+        }
+        val counts = all.groupingBy { tenth(it) }.eachCount()
+        if (counts.size == 1) return Pair(all[0], null)
+        if (counts.size == 2) {
+            val maxCount = counts.values.maxOrNull() ?: return Pair(null, null)
+            val topKeys = counts.filterValues { it == maxCount }.keys
+            if (topKeys.size == 1) {
+                val pKey = topKeys.first()
+                val p = all.first { tenth(it) == pKey }
+                val t = all.first { tenth(it) != pKey }
+                return Pair(p, t)
+            }
+        }
+        return Pair(null, null)
+    }
+
+    /**
+     * شاشة "الرحلات تحت بعضها" في إن درايف (مش كارت رحلة واحدة): فيها أكتر من رقم استلام بعلامة ~.
+     * شاشة الرحلة نفسها فيها كلمات مميزة (اقترح أجرتك / القبول مقابل) فمبنعتبرهاش قائمة أبداً.
+     */
+    fun looksLikeInDriveList(originalText: String): Boolean {
+        val text = normalizeDigits(originalText)
+        if (OFFER_MARKERS.any { text.contains(it, ignoreCase = true) }) return false
+        val seen = mutableSetOf<Int>()
+        for (line in text.split("\n")) {
+            if (TILDE_CHARS.none { line.contains(it) }) continue
+            for (v in extractLineDistances(line)) seen.add(tenth(v))
+        }
+        return seen.size >= 2
     }
 
     fun parse(originalText: String, app: SupportedApp, isListCard: Boolean = false): OrderDetails {
@@ -163,10 +229,19 @@ class AytosCardParser {
             }
         }
 
-        // Distribute distances (usually first is pickup, second is trip or vice versa depending on context)
-        if (foundDistances.isNotEmpty()) {
+        // إن درايف: الرقم اللي بعلامة ~ جنب السعر هو مسافة الاستلام (مش الرحلة).
+        // مسافة الرحلة بتيجي من الفقاعة الخضرا على الخريطة (بنقراها من لون الـ OCR).
+        if (app == SupportedApp.INDRIVER) {
+            val tildeValues = mutableListOf<Double>()
+            for (line in lines) {
+                if (TILDE_CHARS.any { line.contains(it) }) tildeValues.addAll(extractLineDistances(line))
+            }
+            val resolved = resolveInDriveDistances(tildeValues, foundDistances)
+            pickupKm = resolved.first
+            tripKm = resolved.second
+        } else if (foundDistances.isNotEmpty()) {
+            // Distribute distances (usually first is pickup, second is trip)
             if (foundDistances.size == 1) {
-                // If only one distance is visible (common on inDrive cards or before accepting)
                 val d = foundDistances[0]
                 if (d < 4.0) {
                     pickupKm = d
@@ -174,7 +249,6 @@ class AytosCardParser {
                     tripKm = d
                 }
             } else {
-                // Usually smaller/first is pickup and longer is trip
                 pickupKm = foundDistances[0]
                 tripKm = foundDistances[1]
             }
@@ -280,5 +354,10 @@ class AytosCardParser {
             isListCard = isListCard
             // No coordinates: the ride apps don't expose them as text, so we never invent any.
         )
+    }
+
+    companion object {
+        private val TILDE_CHARS = listOf("~", "≈", "\u223C", "\u2053", "\uFF5E")
+        private val OFFER_MARKERS = listOf("اقترح أجرتك", "القبول مقابل", "Offer your fare", "Accept for")
     }
 }

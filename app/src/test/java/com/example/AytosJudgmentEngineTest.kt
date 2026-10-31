@@ -121,4 +121,32 @@ class AytosJudgmentEngineTest {
         assertEquals(PaymentMethod.CASH, parsed.paymentMethod)
         assertEquals(15, parsed.orderAgeSeconds)
     }
+
+    @Test
+    fun testInDriveSingleTildeDistanceIsPickup() {
+        val raw = "طلب ركوب\n109 EGP\n~7,3 كم\nالقبول مقابل 109 EGP"
+        val parsed = parser.parse(raw, SupportedApp.INDRIVER)
+
+        assertEquals(109.0, parsed.fare ?: 0.0, 0.01)
+        assertEquals(7.3, parsed.pickupDistanceKm ?: 0.0, 0.01)
+        assertTrue(parsed.tripDistanceKm == null)
+    }
+
+    @Test
+    fun testInDriveOtherDistanceIsTrip() {
+        val raw = "109 EGP\n~4,9 كم\n14 دقيقة\n4,9 كم\n16 دقيقة\n8,6 كم"
+        val parsed = parser.parse(raw, SupportedApp.INDRIVER)
+
+        assertEquals(4.9, parsed.pickupDistanceKm ?: 0.0, 0.01)
+        assertEquals(8.6, parsed.tripDistanceKm ?: 0.0, 0.01)
+    }
+
+    @Test
+    fun testInDriveListDetection() {
+        val list = "54 EGP\n~1,2 كم\n25 EGP\n~1,3 كم\n49 EGP\n~1,9 كم"
+        assertTrue(parser.looksLikeInDriveList(list))
+
+        val offer = "109 EGP\n~7,3 كم\nاقترح أجرتك"
+        assertTrue(!parser.looksLikeInDriveList(offer))
+    }
 }

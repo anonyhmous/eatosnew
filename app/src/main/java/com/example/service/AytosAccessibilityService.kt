@@ -16,7 +16,8 @@ import androidx.annotation.RequiresApi
 import com.example.data.AytosRepository
 import com.example.engine.AytosCardParser
 import com.example.engine.AytosOcrEngine
-import com.example.engine.OcrNumber
+import com.example.engine.BubbleColor
+import com.example.engine.OcrOutput
 import com.example.model.SupportedApp
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -45,7 +46,13 @@ class AytosAccessibilityService : AccessibilityService() {
 
     private var lastProcessTime = 0L
     private var lastCardSeenTime = 0L
+    private var lastSupportedSeenTime = 0L
     private var hideJob: Job? = null
+    private var tickJob: Job? = null
+
+    // آخر مسافات اتقرت للطلب الحالي، عشان قراءة ناقصة ما تمسحش قراءة صح اتقرت قبلها
+    private var memPickup: Double? = null
+    private var memTrip: Double? = null
 
     private var ocrBusy = false
     private var lastOcrAt = 0L
@@ -65,19 +72,41 @@ class AytosAccessibilityService : AccessibilityService() {
             Log.e(TAG, "onServiceConnected failed", e)
         }
 
-        // نقفل الكارت بعد ما الطلب يختفي من الشاشة بكام ثانية
-        hideJob?.cancel()
-        hideJob = serviceScope.launch {
+        // قراءة دورية مستمرة: الشاشة الثابتة مبتبعتش أحداث، فمن غير ده الكارت كان بيتقفل ومبيرجعش
+        tickJob?.cancel()
+        tickJob = serviceScope.launch {
             while (isActive) {
-                delay(1500)
-                val r = repo()
-                if (r.isOverlayVisible.value && lastCardSeenTime > 0L &&
-                    System.currentTimeMillis() - lastCardSeenTime > CARD_GONE_MS
-                ) {
-                    r.dismissOverlay()
+                val idle = System.currentTimeMillis() - lastSupportedSeenTime > IDLE_AFTER_MS
+                delay(if (idle) TICK_IDLE_MS else TICK_MS)
+                try {
+                    scan()
+                } catch (e: Exception) {
+                    Log.e(TAG, "periodic scan failed", e)
                 }
             }
         }
+
+        // نقفل الكارت بس لما الطلب يختفي فعلاً أو السواق يسيب التطبيق
+        hideJob?.cancel()
+        hideJob = serviceScope.launch {
+            while (isActive) {
+                delay(1000)
+                val r = repo()
+                val now = System.currentTimeMillis()
+                val appGone = lastSupportedSeenTime > 0L && now - lastSupportedSeenTime > APP_GONE_MS
+                val cardGone = lastCardSeenTime > 0L && now - lastCardSeenTime > CARD_GONE_MS
+                if (appGone || cardGone) {
+                    if (r.isOverlayVisible.value || lastCardSeenTime > 0L) r.dismissOverlay()
+                    lastCardSeenTime = 0L
+                    resetMemory()
+                }
+            }
+        }
+    }
+
+    private fun resetMemory() {
+        memPickup = null
+        memTrip = null
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -91,59 +120,114 @@ class AytosAccessibilityService : AccessibilityService() {
     }
 
     private fun handleEvent(event: AccessibilityEvent) {
+        val pkg = event.packageName?.toString() ?: return
+        if (SupportedApp.fromPackage(pkg) == null) return // أي تطبيق تاني بيتتجاهل تماماً
+        scan()
+    }
+
+    /** بتقرا الشاشة (من الأحداث ومن المؤقت الدوري)، ولو فيها كارت طلب بتبعته للحكم. */
+    private fun scan() {
         val r = repo()
         if (!r.preferences.isReaderActiveFlow.value) return
-
-        val pkg = event.packageName?.toString() ?: return
-        val eventApp = SupportedApp.fromPackage(pkg) ?: return // أي تطبيق تاني بيتتجاهل تماماً
-
-        r.lastActivityTime = System.currentTimeMillis()
 
         val now = System.currentTimeMillis()
         if (now - lastProcessTime < THROTTLE_MS) return
         lastProcessTime = now
 
         // 1) نص الشاشة من كل نوافذ التطبيقات المدعومة (الكارت غالباً نافذة منفصلة عن الخريطة)
-        var app: SupportedApp = eventApp
-        val builder = StringBuilder()
+        var app: SupportedApp? = null
+        val roots = mutableListOf<AccessibilityNodeInfo>()
         try {
             for (w in windows) {
                 val root = w.root ?: continue
                 val wApp = SupportedApp.fromPackage(root.packageName?.toString()) ?: continue
                 app = wApp
-                extractNodeTexts(root, builder, 0)
+                roots.add(root)
             }
         } catch (e: Exception) {
             Log.w(TAG, "windows scan failed, falling back to active window", e)
         }
-        if (builder.isBlank()) {
+        if (roots.isEmpty()) {
             val root = rootInActiveWindow
             val rootApp = SupportedApp.fromPackage(root?.packageName?.toString())
             if (root != null && rootApp != null) {
                 app = rootApp
-                extractNodeTexts(root, builder, 0)
+                roots.add(root)
             }
+        }
+        val currentApp = app ?: return // مفيش تطبيق توصيل قدام السواق
+
+        lastSupportedSeenTime = now
+        r.lastActivityTime = now
+
+        // الأول بنقرا العناصر الظاهرة بس (عشان شاشات قديمة ورا الكارت ما تلخبطش)، ولو طلع فاضي نقرا الكل
+        val builder = StringBuilder()
+        for (root in roots) extractNodeTexts(root, builder, 0, true)
+        if (builder.isBlank()) {
+            for (root in roots) extractNodeTexts(root, builder, 0, false)
         }
         val screenText = builder.toString().trim()
         r.lastCapture = "[نص الشاشة]\n$screenText"
 
         // 2) لو النص لوحده كفاية بنعرض الحكم فوراً، والـ OCR بيكمّل الناقص بعدها
-        if (screenText.isNotBlank()) evaluate(app, screenText, null)
+        if (screenText.isNotBlank()) evaluate(currentApp, screenText, null)
 
         // 3) الـ OCR شغال دايماً (بفاصل زمني) حتى لو النص فاضي
-        requestOcr(app, screenText)
+        requestOcr(currentApp, screenText)
     }
 
-    /** بيحوّل النص (ولو متاح أرقام الـ OCR) لطلب، ولو شكله كارت طلب بيبعته للحكم. */
-    private fun evaluate(app: SupportedApp, text: String, ocrNumbers: List<OcrNumber>?) {
+    /**
+     * بيحوّل النص + نتيجة الـ OCR لطلب، ولو شكله كارت طلب بيبعته للحكم.
+     * المسافات: الاستلام من نص الشاشة (أو الفقاعة الزرقا)، والرحلة من الفقاعة الخضرا.
+     * وبنحتفظ بآخر قراءة صح للطلب الحالي عشان قراءة ناقصة ما تمسحهاش.
+     */
+    private fun evaluate(app: SupportedApp, text: String, ocr: OcrOutput?) {
+        val r = repo()
+
+        // شاشة الرحلات تحت بعضها مش كارت رحلة واحدة: مفيش حكم، والكارت القديم يتقفل
+        if (app == SupportedApp.INDRIVER && cardParser.looksLikeInDriveList(text)) {
+            if (r.isOverlayVisible.value || lastCardSeenTime > 0L) r.dismissOverlay()
+            lastCardSeenTime = 0L
+            resetMemory()
+            return
+        }
+
         val parsed = cardParser.parse(text, app)
-        val order = if (ocrNumbers != null) cardParser.fillFromOcrNumbers(parsed, ocrNumbers) else parsed
+        var pickup = parsed.pickupDistanceKm
+        var trip = parsed.tripDistanceKm
+
+        var order = parsed
+        if (ocr != null) {
+            val blue = ocr.bubbles.firstOrNull { it.color == BubbleColor.BLUE }?.km
+            val green = ocr.bubbles.firstOrNull { it.color == BubbleColor.GREEN }?.km
+            if (green != null) trip = green          // اللون هو المرجع للرحلة
+            if (pickup == null) pickup = blue
+
+            // تكملة السعر (ولو مش إن درايف، تخمين المسافات القديم لو مفيش ألوان ولا نص)
+            val noColors = blue == null && green == null
+            val guess = app != SupportedApp.INDRIVER && noColors && pickup == null && trip == null
+            order = cardParser.fillFromOcrNumbers(parsed, ocr.numbers, guess)
+            if (guess) {
+                pickup = order.pickupDistanceKm
+                trip = order.tripDistanceKm
+            }
+        }
+
+        // طلب جديد (استلام اختلف كتير) = ننسى مسافة الرحلة القديمة
+        val oldPickup = memPickup
+        if (pickup != null && oldPickup != null && kotlin.math.abs(pickup - oldPickup) > NEW_ORDER_PICKUP_DELTA) {
+            memTrip = null
+        }
+        if (pickup != null) memPickup = pickup
+        if (trip != null) memTrip = trip
+
+        order = order.copy(pickupDistanceKm = pickup ?: memPickup, tripDistanceKm = trip ?: memTrip)
 
         // مش كارت طلب (شاشة رئيسية، أرباح، قوائم...) = مفيش حكم وهمي
         if (!cardParser.looksLikeOrderCard(order)) return
 
         lastCardSeenTime = System.currentTimeMillis()
-        repo().processOrder(order)
+        r.processOrder(order)
     }
 
     // ------------------------------------------------------------------ OCR
@@ -193,8 +277,11 @@ class AytosAccessibilityService : AccessibilityService() {
                             prepared.recycle()
                             if (output != null) {
                                 val r = repo()
-                                r.lastCapture = "[نص الشاشة]\n$screenText\n\n[OCR]\n${output.text}"
-                                evaluate(app, screenText + "\n" + output.text, output.numbers)
+                                val bubblesInfo = output.bubbles.joinToString(" | ") {
+                                    "${if (it.color == BubbleColor.BLUE) "أزرق" else "أخضر"}=${it.km}"
+                                }
+                                r.lastCapture = "[نص الشاشة]\n$screenText\n\n[OCR]\n${output.text}\n\n[فقاعات ملوّنة] $bubblesInfo"
+                                evaluate(app, screenText + "\n" + output.text, output)
                             }
                         }
                     } catch (e: Exception) {
@@ -254,8 +341,9 @@ class AytosAccessibilityService : AccessibilityService() {
 
     // ------------------------------------------------------------ node text
 
-    private fun extractNodeTexts(node: AccessibilityNodeInfo?, builder: StringBuilder, depth: Int) {
+    private fun extractNodeTexts(node: AccessibilityNodeInfo?, builder: StringBuilder, depth: Int, visibleOnly: Boolean) {
         if (node == null || depth > MAX_DEPTH || builder.length > MAX_CHARS) return
+        if (visibleOnly && !node.isVisibleToUser) return
 
         node.text?.let {
             if (it.isNotBlank()) builder.append(it).append("\n")
@@ -265,7 +353,7 @@ class AytosAccessibilityService : AccessibilityService() {
         }
 
         for (i in 0 until node.childCount) {
-            extractNodeTexts(node.getChild(i), builder, depth + 1)
+            extractNodeTexts(node.getChild(i), builder, depth + 1, visibleOnly)
         }
     }
 
@@ -275,6 +363,7 @@ class AytosAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         hideJob?.cancel()
+        tickJob?.cancel()
         serviceScope.cancel()
         ocrEngine.close()
         super.onDestroy()
@@ -283,7 +372,12 @@ class AytosAccessibilityService : AccessibilityService() {
     companion object {
         private const val TAG = "AytosAccessibility"
         private const val THROTTLE_MS = 500L
-        private const val CARD_GONE_MS = 8_000L
+        private const val CARD_GONE_MS = 6_000L
+        private const val APP_GONE_MS = 3_000L
+        private const val TICK_MS = 1_000L
+        private const val TICK_IDLE_MS = 3_000L
+        private const val IDLE_AFTER_MS = 10_000L
+        private const val NEW_ORDER_PICKUP_DELTA = 0.6
         private const val OCR_FAST_MS = 1_200L
         private const val OCR_IDLE_MS = 2_500L
         private const val OCR_STUCK_MS = 6_000L

@@ -51,6 +51,8 @@ class AytosRepository(
     private var lastOrderSignature: String = ""
     private var lastOrderTime: Long = 0L
     private var suppressedSignature: String = ""
+    private var lastOrderKey: String = ""
+    private var suppressedKey: String = ""
     private var lastRecordedKey: String = ""
     private var lastRecordedTime: Long = 0L
 
@@ -110,10 +112,13 @@ class AytosRepository(
         // التوقيع بيعتمد على الأرقام بس (مش العناوين) عشان نص الـ OCR بيتغير من قراءة للتانية
         val signature = "${order.app}|${order.fare}|${order.pickupDistanceKm}|${order.tripDistanceKm}"
         val now = System.currentTimeMillis()
+        // مفتاح التجاهل: التطبيق + السعر بس، عشان تحديث مسافة جاية متأخر ما يرجّعش كارت السواق قفله
+        val orderKey = "${order.app}|${order.fare}"
         if (record) {
-            if (signature == suppressedSignature) return // السواق قفل الكارت ده بإيده
+            if (orderKey == suppressedKey) return // السواق قفل الكارت ده بإيده
             if (signature == lastOrderSignature && (_isOverlayVisible.value || now - lastOrderTime < 20_000L)) return
             lastOrderSignature = signature
+            lastOrderKey = orderKey
             lastOrderTime = now
         }
 
@@ -165,9 +170,12 @@ class AytosRepository(
     fun dismissOverlay(byUser: Boolean = false) {
         if (byUser) {
             suppressedSignature = lastOrderSignature
+            suppressedKey = lastOrderKey
         } else {
             lastOrderSignature = ""
             suppressedSignature = ""
+            lastOrderKey = ""
+            suppressedKey = ""
         }
         _isOverlayVisible.value = false
         overlayBounds = null
