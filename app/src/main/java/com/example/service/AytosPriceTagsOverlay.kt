@@ -46,7 +46,7 @@ class AytosPriceTagsOverlay(private val context: Context) {
             val loc = IntArray(2)
             getLocationOnScreen(loc) // لو الطبقة مش بادية من أعلى الشاشة بالظبط، نعدّل الإحداثيات
             for (t in tags) {
-                val cx = t.bounds.centerX() - loc[0]
+                val cx = (t.bounds.centerX() - loc[0]).toFloat()
                 val bottom = t.bounds.top - loc[1] - 2f * density
                 val w = textPaint.measureText(t.text) + 14f * density
                 val h = textPaint.textSize + 8f * density
