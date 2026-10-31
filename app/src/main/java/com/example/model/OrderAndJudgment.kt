@@ -11,6 +11,7 @@ data class OrderDetails(
     val fare: Double? = null,                       // السعر
     val pickupDistanceKm: Double? = null,           // مسافة الاستلام
     val tripDistanceKm: Double? = null,             // مسافة الرحلة
+    val tripMinutes: Int? = null,                   // زمن الرحلة بالدقايق (من فقاعة الخريطة)
     val passengerRating: Double? = null,           // تقييم الراكب
     val passengerTripsCount: Int? = null,          // عدد رحلات الراكب
     val orderAgeSeconds: Int? = null,              // عمر الطلب بالثواني
@@ -100,5 +101,8 @@ data class JudgmentResult(
     val directionAdvancementPct: Int? = null,      // نسبة التقريب لوجهة السائق (مروّح / رايح هناك)
     val reasons: List<String> = emptyList(),        // أسباب الرفض أو التنبيه
     val unparsedFields: List<String> = emptyList(), // الحقول التي لم تقرأ بوضوح (دون تخمين)
-    val isOpportunity: Boolean = false             // هل تنطبق عليه كل الشروط لفرصة مميزة وتنبيه صوتي
+    val isOpportunity: Boolean = false,            // هل تنطبق عليه كل الشروط لفرصة مميزة وتنبيه صوتي
+    val negotiateMaxFare: Double? = null,          // إن درايف: أعلى سعر ينفع تتفاوض بيه (السعر × 1.45)
+    val roadSpeedKmh: Double? = null,              // متوسط سرعة الرحلة (كم/س) لمؤشر الطريق
+    val fullRatePerKm: Double? = null              // السعر ÷ (استلام + رحلة كاملين)
 )

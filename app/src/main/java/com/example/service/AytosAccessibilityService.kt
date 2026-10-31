@@ -53,6 +53,11 @@ class AytosAccessibilityService : AccessibilityService() {
     // آخر مسافات اتقرت للطلب الحالي، عشان قراءة ناقصة ما تمسحش قراءة صح اتقرت قبلها
     private var memPickup: Double? = null
     private var memTrip: Double? = null
+    private var memTripMin: Int? = null
+
+    // أرقام سعر الكيلو فوق أزرار اقتراح الأسعار (إن درايف)
+    private val priceTags by lazy { AytosPriceTagsOverlay(applicationContext) }
+    private var lastPriceButtons: List<Pair<Rect, Double>> = emptyList()
 
     private var ocrBusy = false
     private var lastOcrAt = 0L
@@ -107,6 +112,83 @@ class AytosAccessibilityService : AccessibilityService() {
     private fun resetMemory() {
         memPickup = null
         memTrip = null
+        memTripMin = null
+        lastPriceButtons = emptyList()
+        clearTags()
+    }
+
+    private fun clearTags() {
+        try {
+            priceTags.clear()
+            repo().extraMaskRects = emptyList()
+        } catch (e: Exception) {
+            Log.w(TAG, "clear tags failed", e)
+        }
+    }
+
+    /** بيكتب سعر الكيلو فوق كل زرار اقتراح سعر، بس لو المسافتين (استلام + رحلة) معروفين فعلاً. */
+    private fun refreshTags(app: SupportedApp) {
+        try {
+            val p = memPickup
+            val t = memTrip
+            if (app != SupportedApp.INDRIVER || p == null || t == null || lastPriceButtons.isEmpty()) {
+                clearTags()
+                return
+            }
+            val total = p + t
+            if (total < 0.1) {
+                clearTags()
+                return
+            }
+            val tags = lastPriceButtons.map { (rect, price) ->
+                PriceTag(rect, String.format("%.2f للكيلو", price / total))
+            }
+            priceTags.show(tags)
+            repo().extraMaskRects = priceTags.currentRects()
+        } catch (e: Exception) {
+            Log.w(TAG, "refresh tags failed", e)
+        }
+    }
+
+    /** أزرار اقتراح الأسعار: نص "54 EGP" لوحده في الربع التحتاني من الشاشة (مش زرار القبول ولا السعر الكبير). */
+    private fun collectPriceButtons(roots: List<AccessibilityNodeInfo>, fare: Double?): List<Pair<Rect, Double>> {
+        val out = mutableListOf<Pair<Rect, Double>>()
+        val minTop = resources.displayMetrics.heightPixels * 0.75f
+        for (root in roots) walkPriceButtons(root, 0, minTop, fare, out)
+        return out
+    }
+
+    private fun walkPriceButtons(
+        node: AccessibilityNodeInfo?, depth: Int, minTop: Float, fare: Double?,
+        out: MutableList<Pair<Rect, Double>>
+    ) {
+        if (node == null || depth > MAX_DEPTH || out.size >= 8) return
+        val txt = node.text?.toString()?.trim()
+        if (txt != null && node.isVisibleToUser) {
+            val m = PRICE_BUTTON.matchEntire(asciiDigits(txt))
+            if (m != null) {
+                val v = m.groupValues[1].replace(',', '.').toDoubleOrNull()
+                val r = Rect()
+                node.getBoundsInScreen(r)
+                if (v != null && r.top >= minTop && !r.isEmpty && (fare == null || kotlin.math.abs(v - fare) > 0.01)) {
+                    out.add(Pair(r, v))
+                }
+            }
+        }
+        for (i in 0 until node.childCount) walkPriceButtons(node.getChild(i), depth + 1, minTop, fare, out)
+    }
+
+    private fun asciiDigits(input: String): String {
+        val sb = StringBuilder(input.length)
+        for (ch in input) {
+            when (ch) {
+                in '\u0660'..'\u0669' -> sb.append('0' + (ch - '\u0660'))
+                in '\u06F0'..'\u06F9' -> sb.append('0' + (ch - '\u06F0'))
+                '\u066B' -> sb.append('.')
+                else -> sb.append(ch)
+            }
+        }
+        return sb.toString()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -172,6 +254,12 @@ class AytosAccessibilityService : AccessibilityService() {
         // 2) لو النص لوحده كفاية بنعرض الحكم فوراً، والـ OCR بيكمّل الناقص بعدها
         if (screenText.isNotBlank()) evaluate(currentApp, screenText, null)
 
+        // أزرار اقتراح الأسعار (إن درايف بس) عشان نكتب فوقها سعر الكيلو
+        lastPriceButtons = if (currentApp == SupportedApp.INDRIVER) {
+            try { collectPriceButtons(roots, repo().latestJudgment.value?.grossFare) } catch (e: Exception) { emptyList() }
+        } else emptyList()
+        refreshTags(currentApp)
+
         // 3) الـ OCR شغال دايماً (بفاصل زمني) حتى لو النص فاضي
         requestOcr(currentApp, screenText)
     }
@@ -201,6 +289,7 @@ class AytosAccessibilityService : AccessibilityService() {
             val blue = ocr.bubbles.firstOrNull { it.color == BubbleColor.BLUE }?.km
             val green = ocr.bubbles.firstOrNull { it.color == BubbleColor.GREEN }?.km
             if (green != null) trip = green          // اللون هو المرجع للرحلة
+            ocr.bubbles.firstOrNull { it.color == BubbleColor.GREEN }?.minutes?.let { memTripMin = it }
             if (pickup == null) pickup = blue
 
             // تكملة السعر (ولو مش إن درايف، تخمين المسافات القديم لو مفيش ألوان ولا نص)
@@ -217,11 +306,16 @@ class AytosAccessibilityService : AccessibilityService() {
         val oldPickup = memPickup
         if (pickup != null && oldPickup != null && kotlin.math.abs(pickup - oldPickup) > NEW_ORDER_PICKUP_DELTA) {
             memTrip = null
+            memTripMin = null
         }
         if (pickup != null) memPickup = pickup
         if (trip != null) memTrip = trip
 
-        order = order.copy(pickupDistanceKm = pickup ?: memPickup, tripDistanceKm = trip ?: memTrip)
+        order = order.copy(
+            pickupDistanceKm = pickup ?: memPickup,
+            tripDistanceKm = trip ?: memTrip,
+            tripMinutes = memTripMin
+        )
 
         // مش كارت طلب (شاشة رئيسية، أرباح، قوائم...) = مفيش حكم وهمي
         if (!cardParser.looksLikeOrderCard(order)) return
@@ -282,6 +376,7 @@ class AytosAccessibilityService : AccessibilityService() {
                                 }
                                 r.lastCapture = "[نص الشاشة]\n$screenText\n\n[OCR]\n${output.text}\n\n[فقاعات ملوّنة] $bubblesInfo"
                                 evaluate(app, screenText + "\n" + output.text, output)
+                                refreshTags(app)
                             }
                         }
                     } catch (e: Exception) {
@@ -328,6 +423,10 @@ class AytosAccessibilityService : AccessibilityService() {
         val black = Paint().apply { color = Color.BLACK }
         // شريط الحالة (الساعة والبطارية) فيه أرقام مش مطلوبة
         canvas.drawRect(0f, 0f, w.toFloat(), h * 0.045f, black)
+        // أرقام سعر الكيلو اللي كاتبينها فوق الأزرار
+        for (b in repo().extraMaskRects) {
+            canvas.drawRect(b.left * scale, b.top * scale, b.right * scale, b.bottom * scale, black)
+        }
         // كارت أيتوس العايم
         repo().overlayBounds?.let { b ->
             canvas.drawRect(
@@ -364,6 +463,7 @@ class AytosAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         hideJob?.cancel()
         tickJob?.cancel()
+        clearTags()
         serviceScope.cancel()
         ocrEngine.close()
         super.onDestroy()
@@ -372,6 +472,7 @@ class AytosAccessibilityService : AccessibilityService() {
     companion object {
         private const val TAG = "AytosAccessibility"
         private const val THROTTLE_MS = 500L
+        private val PRICE_BUTTON = Regex("^(\\d+(?:[.,]\\d+)?)\\s*EGP$")
         private const val CARD_GONE_MS = 6_000L
         private const val APP_GONE_MS = 3_000L
         private const val TICK_MS = 1_000L

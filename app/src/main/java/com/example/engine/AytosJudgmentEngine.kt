@@ -64,8 +64,8 @@ class AytosJudgmentEngine {
 
         // Fuel and maintenance calculations
         val litersPerKm = rules.engineSize.avgLitersPer100Km / 100.0
-        val fuelCost = actualTotalDistance * litersPerKm * rules.fuelPricePerLiter
-        val maintenanceCost = actualTotalDistance * rules.maintenanceCostPerKm
+        val fuelCost = 0.0 // مش بنخصم بنزين: الخصم بس عمولة التطبيق
+        val maintenanceCost = 0.0 // ولا صيانة
 
         // Net profit left in driver's pocket after all costs:
         val netProfit = fare - (commissionAmount + fuelCost + maintenanceCost)
@@ -203,6 +203,19 @@ class AytosJudgmentEngine {
             }
         }
 
+        // إن درايف: أعلى سعر مسموح بالتفاوض = السعر × 1.45 (متأكد منه على 4 رحلات) ويتقرّب لتحت
+        val negotiateMax = if (order.app == SupportedApp.INDRIVER) floor(fare * 1.45) else null
+
+        // سرعة الرحلة من الدقايق والكيلومترات اللي على الفقاعة الخضرا
+        val speedKmh = if (order.tripDistanceKm != null && order.tripMinutes != null && order.tripMinutes > 0) {
+            order.tripDistanceKm / (order.tripMinutes / 60.0)
+        } else null
+
+        // السعر لكل كيلو بالاستلام والرحلة كاملين (زي الكارت اللي السواق اتعود عليه)
+        val fullRate = if (order.pickupDistanceKm != null && order.tripDistanceKm != null && actualTotalDistance > 0.1) {
+            fare / actualTotalDistance
+        } else null
+
         return JudgmentResult(
             verdict = verdict,
             order = order,
@@ -218,7 +231,10 @@ class AytosJudgmentEngine {
             directionAdvancementPct = directionAdvancementPct,
             reasons = reasons,
             unparsedFields = unparsedFields,
-            isOpportunity = isOpportunity
+            isOpportunity = isOpportunity,
+            negotiateMaxFare = negotiateMax,
+            roadSpeedKmh = speedKmh,
+            fullRatePerKm = fullRate
         )
     }
 

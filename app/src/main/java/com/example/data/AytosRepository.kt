@@ -44,6 +44,10 @@ class AytosRepository(
     @Volatile
     var overlayBounds: android.graphics.Rect? = null
 
+    /** أماكن إضافية بنخفيها من لقطة الـ OCR (أرقام سعر الكيلو اللي فوق أزرار الأسعار). */
+    @Volatile
+    var extraMaskRects: List<android.graphics.Rect> = emptyList()
+
     /** Last time a supported ride app was seen by the accessibility service (for auto-stop). */
     @Volatile
     var lastActivityTime: Long = System.currentTimeMillis()
